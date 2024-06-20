@@ -15,15 +15,6 @@ from queue import Queue
 import pyqtgraph as pg
 
 
-# class MplCanvas(FigureCanvas):
-#     def __init__(self, parent=None, width=15, height=4, dpi=100, channels=4):
-#         fig = Figure(figsize=(width, height), dpi=dpi, facecolor='black')
-#         gs = fig.add_gridspec(channels, hspace=0)
-#         self.axes = gs.subplots()
-#         super(MplCanvas, self).__init__(fig)
-#         # fig.tight_layout()
-          
-
 class GUI(QtWidgets.QMainWindow):
     def __init__(self, model):
         QtWidgets.QMainWindow.__init__(self)
@@ -31,23 +22,31 @@ class GUI(QtWidgets.QMainWindow):
         
         self.model = model
 
-        self.pgwin = pg.GraphicsLayoutWidget()
+        self.pgwin = pg.PlotWidget()
         
 
         self.threadpool = QtCore.QThreadPool()	
         self.q = queue.Queue(maxsize=20)
 
+        self.accuracy = None
+        self.total_predictions = 0
+        self.correct_predictions = 0
+
         self.window_length = 1000
         self.downsample = 1
         self.n_channels = 10
-        self.interval = 4 
-        self.samplerate = 250
+        self.samplerate = 100
+        self.interval = 10
         self.length = 500
+        self.trial_size = 500
 
-        self.file = "Session1_Sub4_Class2_MI_100LP_Resampled250.csv"
-        self.eeg = pd.read_csv(self.file, usecols=range(2,32)).to_numpy()
+        self.file = "sub1ses1_cls4_MI_100LP_Resampled_5.csv"
+        self.eeg1 = pd.read_csv(self.file, usecols=range(1,32)).to_numpy()
 
-        # self.canvas = MplCanvas(self, width=15, height=5, dpi=100, channels=self.n_channels)
+        reshaped_arr = self.eeg1.reshape(-1, self.trial_size, self.eeg1.shape[1])
+        np.random.shuffle(reshaped_arr)
+        self.eeg = reshaped_arr.reshape(self.eeg1.shape)
+
         self.ui.gridLayout_2.addWidget(self.pgwin, 0, 1, 1, 1)
         self.reference_plots = []
         
@@ -56,32 +55,47 @@ class GUI(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer()
         self.timer.setInterval(self.interval) #msec
         self.timer.timeout.connect(self.update_plot)
-        self.timer.start()
+        # self.timer.start()
 
         self.startBtn.clicked.connect(self.start_worker)
         self.stopBtn.clicked.connect(self.stop_stream)
         self.stopBtn.setEnabled(False)
         self.running = True
+
+        # self.lineEdit.textChanged['QString'].connect(self.update_window_length)
+
+        self.accValue.setText("N/A")
         
         
     def dataStream(self):
         try:
             i=0
             while self.running:
-                 self.q.put(self.eeg[i,0:self.n_channels]/1000)
-                 self.model.q.put(self.eeg[i,0:30])
+                 self.q.put(self.eeg[i,1:self.n_channels+1]/1000) # +1 to include class
+                 self.model.q.put(self.eeg[i,0:31])
                  time.sleep(1/250)
                  i+=1
         except Exception as e:
-            print("ERROR: ",e)
+            print("STREAM ERROR: ",e)
 
     def classify(self):
         try:
             while self.running:
-                output = self.model.run()
-                self.accLbl.setText(str(output))
+                output, true_label = self.model.run()
+                if true_label == None:
+                    continue
+                predicted_label = np.argmax(output.detach().numpy().flatten())
+                self.update_labels(true_label, predicted_label)
+                
+                self.total_predictions += 1
+                if true_label == predicted_label:
+                        self.correct_predictions += 1
+
+                self.accuracy = (self.correct_predictions/self.total_predictions)*100
+                
+                self.accValue.setText(f"{self.accuracy:.2f}%")
         except Exception as e:
-            print("ERRORdada: ",e)
+            print("MODEL ERROR: ",e)
 
     def start_worker(self):
         self.running = True
@@ -103,6 +117,34 @@ class GUI(QtWidgets.QMainWindow):
         self.running = False
         self.model.stop()
         self.timer.stop()
+
+    def update_labels(self, true_label, predicted_label):
+
+        self.true_0.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+        self.true_1.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+        self.true_2.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+        self.true_3.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+
+        self.predicted_0.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+        self.predicted_1.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+        self.predicted_2.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);")
+        self.predicted_3.setStyleSheet("background-color: rgb(245, 245, 245); border: 2px solid; border-color: rgb(185, 185, 185);") 
+
+        style = "background-color: rgb(221, 255, 213); border: 2px solid; border-color: rgb(0, 209, 0);"
+        trueLbl = getattr(self, f'true_{int(true_label)}')  
+        trueLbl.setStyleSheet(style)     
+
+        if true_label == predicted_label:
+            style_predicted = "background-color: rgb(221, 255, 213); border: 2px solid; border-color: rgb(0, 209, 0);"
+            predictedLbl = getattr(self, f'predicted_{int(true_label)}')
+        
+        else:
+            style_predicted = "background-color: rgb(255, 206, 206); border: 2px solid red;"
+            predictedLbl = getattr(self, f'predicted_{int(predicted_label)}')
+
+        predictedLbl.setStyleSheet(style_predicted)
+            
+            
         
     # def update_window_length(self,value):
     #     self.window_length = int(value)
@@ -124,33 +166,18 @@ class GUI(QtWidgets.QMainWindow):
                 self.plotdata = np.roll(self.plotdata, -shift, axis = 0)
                 self.plotdata[-shift:,:] = data
                 self.ydata = self.plotdata[:]
-                # self.canvas.axes.set_facecolor((0,0,0)) 
                 self.max = 10
                 self.min = -10
                 
                 if len(self.reference_plots)==0:
+                    self.pgwin.setYRange(-15, 12*self.n_channels)
                     for i in range(self.n_channels):
-                        self.plotHandler = self.pgwin.addPlot()
-                        self.plotHandler.setYRange(self.min, self.max, padding=0.02)
-                        self.plotHandler.setXRange(0, self.length, padding=0.1)
-                        self.plotHandler.setMouseEnabled(x=False, y=False)
-                        self.plotHandler.showAxes(False, showValues=False, size=False)
-                        self.pgwin.nextRow()
-                        self.reference_plots.append(self.plotHandler.plot(self.ydata[:,i], pen=(i,3)))
-                    # for ax in range(self.n_channels):
-                    #     plot_refs = self.canvas.axes[ax].plot(self.ydata[:,ax], color=(0,1,0.12), linewidth=0.5)
-                    #     self.reference_plots.append(plot_refs[0])
-                    #     self.canvas.axes[ax].axis('off')	
+                        self.reference_plots.append(self.pgwin.plot(self.ydata[:,i]+12*i, pen=(1,3)))
                         
                 else:
                     for i in range(self.n_channels):
-                        self.reference_plots[i].setData(self.ydata[:,i])
-                    # for plot in range(self.n_channels):
-                    #     self.reference_plots[plot].set_ydata(self.ydata[:,plot])
+                        self.reference_plots[i].setData(self.ydata[:,i]+12*i)
 
-            # for plot in range(self.n_channels):
-            #     self.canvas.axes[plot].set_ylim( ymin=self.min, ymax=self.max)		
-            # self.canvas.draw()
         except Exception as e:
             self.errorLbl.setText(str(e))
             self.errorLbl.setStyleSheet("background-color: rgb(255, 226, 226); color: black; border: 1px solid red;")

@@ -1,15 +1,20 @@
-import torch #import pytorch library
-import torch.nn as nn #import nn module from torch.nn library
-import math #import math
-import matplotlib.pyplot as plt #THis is too plt statistics regarding the model
-import pandas as pd # PAndas foor manage csv data
-import numpy as np #handling ragading pandas output arrays
+from typing import Optional, Tuple
+import copy
+from torch.nn.init import xavier_uniform_, xavier_normal_, constant_
+from torch import Tensor
+from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
+import torch.nn.functional as F
 import torch
+import torch.nn as nn
+import math
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import math
+import csv
 
 # Check if GPU is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,60 +122,100 @@ class FeedForwardBlock(nn.Module):
 
 class MultiHeadAttentionBlock(nn.Module):
 
-    """
-    This is class to define multihead attention block for the transfomer
+    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False,
+                 kdim=None, vdim=None, batch_first=True, device=None, dtype=None) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super(MultiHeadAttentionBlock, self).__init__()
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
 
-    """
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
-    def __init__(self, v_dimentions: int, n_heads: int, dropout: float):
-        super().__init__()
-        self.v_dimentions = v_dimentions # Embedding vector size
-        self.heads = n_heads # Number of heads
-        # Make sure v_dimentions is divisible by heads
-        assert v_dimentions % n_heads == 0, "v_dimentions is not divisible by number of heads"
+        if self._qkv_same_embed_dim is False:
+            self.q_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
+            self.k_proj_weight = nn.Parameter(torch.empty((embed_dim, self.kdim), **factory_kwargs))
+            self.v_proj_weight = nn.Parameter(torch.empty((embed_dim, self.vdim), **factory_kwargs))
+            self.register_parameter('in_proj_weight', None)
+        else:
+            self.in_proj_weight = nn.Parameter(torch.empty((3 * embed_dim, embed_dim), **factory_kwargs))
+            self.register_parameter('q_proj_weight', None)
+            self.register_parameter('k_proj_weight', None)
+            self.register_parameter('v_proj_weight', None)
 
-        self.d_k = v_dimentions // n_heads # Dimension of vector seen by each head
-        self.w_q = nn.Linear(v_dimentions, v_dimentions) # Weight matrix initiating for query
-        self.w_k = nn.Linear(v_dimentions, v_dimentions) # Weight matrix initiating for key
-        self.w_v = nn.Linear(v_dimentions, v_dimentions) # Weight matrix initiating for values
-        self.w_o = nn.Linear(v_dimentions, v_dimentions) # Weight matrix initiating for heading values
-        self.dropout = nn.Dropout(dropout)
+        if bias:
+            self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim, **factory_kwargs))
+        else:
+            self.register_parameter('in_proj_bias', None)
+        self.out_proj = NonDynamicallyQuantizableLinear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
-    @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
-        d_k = query.shape[-1]
-        # Just apply the formula from the paper
-        # (batch, h, token_len, d_k) --> (batch, h, token_len, token_len)
-        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
-        if mask is not None:
-            # Write a very low value (indicating -inf) to the positions where mask == 0
-            attention_scores.masked_fill_(mask == 0, -1e9)
-        attention_scores = attention_scores.softmax(dim=-1) # (batch, h, token_len, token_len) # Apply softmax along last dimention
-        if dropout is not None:
-            attention_scores = dropout(attention_scores)
-        # (batch, h, token_len, token_len) --> (batch, h, token_len, d_k)
-        # return attention scores which can be used for visualization
-        return (attention_scores @ value), attention_scores
+        if add_bias_kv:
+            self.bias_k = nn.Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
+            self.bias_v = nn.Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
+        else:
+            self.bias_k = self.bias_v = None
 
-    def forward(self, q, k, v, mask):
-        query = self.w_q(q) # (batch, token_len, v_dimentions) --> (batch, token_len, v_dimentions)
-        key = self.w_k(k) # (batch, token_len, v_dimentions) --> (batch, token_len, v_dimentions)
-        value = self.w_v(v) # (batch, token_len, v_dimentions) --> (batch, token_len, v_dimentions)
+        self.add_zero_attn = add_zero_attn
 
-        # (batch, token_len, v_dimentions) --> (batch, token_len, n_heads, ) --> (batch, n_heads, token_len, d_k)
-        # Final matrix should be addressing sequnce for each heads .view and .transpose used
-        query = query.view(query.shape[0], query.shape[1], self.heads, self.d_k).transpose(1, 2)
-        key = key.view(key.shape[0], key.shape[1], self.heads, self.d_k).transpose(1, 2)
-        value = value.view(value.shape[0], value.shape[1], self.heads, self.d_k).transpose(1, 2)
+        self._reset_parameters()
 
-        # Calculate attention
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+    def _reset_parameters(self):
+        if self._qkv_same_embed_dim:
+            xavier_uniform_(self.in_proj_weight)
+        else:
+            xavier_uniform_(self.q_proj_weight)
+            xavier_uniform_(self.k_proj_weight)
+            xavier_uniform_(self.v_proj_weight)
 
-        # (batch, n_heads, token_len, d_k) --> (batch, token_len, n_heads, d_k) --> (batch, token_len, v_dimentions)
-        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.heads * self.d_k)
+        if self.in_proj_bias is not None:
+            constant_(self.in_proj_bias, 0.)
+            constant_(self.out_proj.bias, 0.)
+        if self.bias_k is not None:
+            xavier_normal_(self.bias_k)
+        if self.bias_v is not None:
+            xavier_normal_(self.bias_v)
 
-        # (batch, token_len, v_dimentions) --> (batch, token_len, v_dimentions)
-        return self.w_o(x)
+    def __setstate__(self, state):
+        if '_qkv_same_embed_dim' not in state:
+            state['_qkv_same_embed_dim'] = True
+
+        super(MultiHeadAttentionBlock, self).__setstate__(state)
+
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, key_padding_mask: Optional[Tensor] = None,
+                need_weights: bool = True, attn_mask: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
+
+        if self.batch_first:
+            query, key, value = [x.transpose(1, 0) for x in (query, key, value)]
+
+        if not self._qkv_same_embed_dim:
+            attn_output, attn_output_weights = F.multi_head_attention_forward(
+                query, key, value, self.embed_dim, self.num_heads,
+                self.in_proj_weight, self.in_proj_bias,
+                self.bias_k, self.bias_v, self.add_zero_attn,
+                self.dropout, self.out_proj.weight, self.out_proj.bias,
+                training=self.training,
+                key_padding_mask=key_padding_mask, need_weights=need_weights,
+                attn_mask=attn_mask, use_separate_proj_weight=True,
+                q_proj_weight=self.q_proj_weight, k_proj_weight=self.k_proj_weight,
+                v_proj_weight=self.v_proj_weight)
+        else:
+            attn_output, attn_output_weights = F.multi_head_attention_forward(
+                query, key, value, self.embed_dim, self.num_heads,
+                self.in_proj_weight, self.in_proj_bias,
+                self.bias_k, self.bias_v, self.add_zero_attn,
+                self.dropout, self.out_proj.weight, self.out_proj.bias,
+                training=self.training,
+                key_padding_mask=key_padding_mask, need_weights=need_weights,
+                attn_mask=attn_mask)
+        if self.batch_first:
+            return attn_output.transpose(1, 0)
+        else:
+            return attn_output
 
 class ResidualConnection(nn.Module):
 
